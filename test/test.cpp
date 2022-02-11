@@ -270,73 +270,6 @@ void WaveformSynthesis(WorldParameters *world_parameters, int fs,
   printf("WORLD: %d [msec]\n", timeGetTime() - elapsed_time);
 }
 
-void WaveformSynthesis2(WorldParameters *world_parameters, int fs,
-    int y_length, double *y) {
-  DWORD elapsed_time;
-  printf("\nSynthesis 2 (All frames are added at the same time)\n");
-  elapsed_time = timeGetTime();
-
-  WorldSynthesizer synthesizer = { 0 };
-  int buffer_size = 64;
-  InitializeSynthesizer(world_parameters->fs, world_parameters->frame_period,
-      world_parameters->fft_size, buffer_size, 1, &synthesizer);
-
-  // All parameters are added at the same time.
-  AddParameters(world_parameters->f0, world_parameters->f0_length,
-      world_parameters->spectrogram, world_parameters->aperiodicity,
-      &synthesizer);
-
-  int index;
-  for (int i = 0; Synthesis2(&synthesizer) != 0; ++i) {
-    index = i * buffer_size;
-    for (int j = 0; j < buffer_size; ++j)
-      y[j + index] = synthesizer.buffer[j];
-  }
-
-  printf("WORLD: %d [msec]\n", timeGetTime() - elapsed_time);
-  DestroySynthesizer(&synthesizer);
-}
-
-void WaveformSynthesis3(WorldParameters *world_parameters, int fs,
-    int y_length, double *y) {
-  DWORD elapsed_time;
-  // Synthesis by the aperiodicity
-  printf("\nSynthesis 3 (Ring buffer is efficiently used.)\n");
-  elapsed_time = timeGetTime();
-
-  WorldSynthesizer synthesizer = { 0 };
-  int buffer_size = 64;
-  InitializeSynthesizer(world_parameters->fs, world_parameters->frame_period,
-      world_parameters->fft_size, buffer_size, 100, &synthesizer);
-
-  int offset = 0;
-  int index = 0;
-  for (int i = 0; i < world_parameters->f0_length;) {
-    // Add one frame (i shows the frame index that should be added)
-    if (AddParameters(&world_parameters->f0[i], 1,
-      &world_parameters->spectrogram[i], &world_parameters->aperiodicity[i],
-      &synthesizer) == 1) ++i;
-
-    // Synthesize speech with length of buffer_size sample.
-    // It is repeated until the function returns 0
-    // (it suggests that the synthesizer cannot generate speech).
-    while (Synthesis2(&synthesizer) != 0) {
-      index = offset * buffer_size;
-      for (int j = 0; j < buffer_size; ++j)
-        y[j + index] = synthesizer.buffer[j];
-      offset++;
-    }
-
-    // Check the "Lock" (Please see synthesisrealtime.h)
-    if (IsLocked(&synthesizer) == 1) {
-      printf("Locked!\n");
-      break;
-    }
-  }
-
-  printf("WORLD: %d [msec]\n", timeGetTime() - elapsed_time);
-  DestroySynthesizer(&synthesizer);
-}
 
 void DestroyMemory(WorldParameters *world_parameters) {
   delete[] world_parameters->time_axis;
@@ -352,95 +285,98 @@ void DestroyMemory(WorldParameters *world_parameters) {
 }  // namespace
 
 //-----------------------------------------------------------------------------
-// Test program.
-// test.exe input.wav outout.wav f0 spec flag
-// input.wav  : argv[1] Input file
-// output.wav : argv[2] Output file
-// f0         : argv[3] F0 scaling (a positive number)
-// spec       : argv[4] Formant shift (a positive number)
+// Copy pitch from one file to another
+// test.exe input1.wav input2.wav output.wav
+// input1.wav : argv[1] Input file
+// input2.wav : argv[2] Pitch reference file
+// output.wav : argv[3] Output file
 //-----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-  if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
-    printf("error\n");
-    return -2;
-  }
+    if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
+        printf("error\n");
+        return -2;
+    }
 
-  // Memory allocation is carried out in advanse.
-  // This is for compatibility with C language.
-  int x_length = GetAudioLength(argv[1]);
-  if (x_length <= 0) {
-    if (x_length == 0) printf("error: File not found.\n");
-    else printf("error: The file is not .wav format.\n");
-    return -1;
-  }
-  double *x = new double[x_length];
-  // wavread() must be called after GetAudioLength().
-  int fs, nbit;
-  wavread(argv[1], &fs, &nbit, x);
-  DisplayInformation(fs, nbit, x_length);
+    // Memory allocation is carried out in advanse.
+    // This is for compatibility with C language.
+    int x_length = GetAudioLength(argv[1]);
+    int ref_length = GetAudioLength(argv[1]);
+    if (x_length <= 0 || ref_length <= 0) {
+        if (x_length == 0 || ref_length == 0) printf("error: File not found.\n");
+        else printf("error: The file is not .wav format.\n");
+        return -1;
+    }
+    if (x_length != ref_length) {
+        printf("error: Invalid reference\n");
+        return -3;
+    }
+    double* x = new double[x_length];
+    double *ref = new double[ref_length];
+    // wavread() must be called after GetAudioLength().
+    int x_fs, x_nbit, ref_fs, ref_nbit;
+    wavread(argv[1], &x_fs, &x_nbit, x);
+    DisplayInformation(x_fs, x_nbit, x_length);
+    wavread(argv[2], &ref_fs, &ref_nbit, ref);
+    DisplayInformation(ref_fs, ref_nbit, ref_length);
 
-  //---------------------------------------------------------------------------
-  // Analysis part
-  //---------------------------------------------------------------------------
-  WorldParameters world_parameters = { 0 };
-  // You must set fs and frame_period before analysis/synthesis.
-  world_parameters.fs = fs;
-  // 5.0 ms is the default value.
-  world_parameters.frame_period = 5.0;
+    //---------------------------------------------------------------------------
+    // Analysis part
+    //---------------------------------------------------------------------------
+    WorldParameters x_world_parameters = { 0 };
+    WorldParameters ref_world_parameters = { 0 };
+    // You must set fs and frame_period before analysis/synthesis.
+    x_world_parameters.fs = x_fs;
+    ref_world_parameters.fs = ref_fs;
+    // 5.0 ms is the default value.
+    x_world_parameters.frame_period = 5.0;
+    ref_world_parameters.frame_period = 5.0;
 
-  // F0 estimation
-  // DIO
-  // F0EstimationDio(x, x_length, &world_parameters);
+    // F0 estimation
+    // DIO
+    // F0EstimationDio(x, x_length, &world_parameters);
 
-  // Harvest
-  F0EstimationHarvest(x, x_length, &world_parameters);
+    // Harvest
+    F0EstimationHarvest(x, x_length, &x_world_parameters);
+    F0EstimationHarvest(ref, ref_length, &ref_world_parameters);
 
-  // Spectral envelope estimation
-  SpectralEnvelopeEstimation(x, x_length, &world_parameters);
+    // Spectral envelope estimation
+    SpectralEnvelopeEstimation(x, x_length, &x_world_parameters);
 
-  // Aperiodicity estimation by D4C
-  AperiodicityEstimation(x, x_length, &world_parameters);
+    // Aperiodicity estimation by D4C
+    AperiodicityEstimation(x, x_length, &x_world_parameters);
 
-  // Note that F0 must not be changed until all parameters are estimated.
-  ParameterModification(argc, argv, fs, world_parameters.f0_length,
-      world_parameters.fft_size, world_parameters.f0,
-      world_parameters.spectrogram);
+    // Note that F0 must not be changed until all parameters are estimated.
 
-  //---------------------------------------------------------------------------
-  // Synthesis part
-  // There are three samples in speech synthesis
-  // 1: Conventional synthesis
-  // 2: Example of real-time synthesis
-  // 3: Example of real-time synthesis (Ring buffer is efficiently used)
-  //---------------------------------------------------------------------------
-  char filename[100];
-  // The length of the output waveform
-  int y_length = static_cast<int>((world_parameters.f0_length - 1) *
-    world_parameters.frame_period / 1000.0 * fs) + 1;
-  double *y = new double[y_length];
+    // Copy pitch from reference onto input
+    for (int i = 0; i < x_world_parameters.f0_length; i++) {
+        x_world_parameters.f0[i] = ref_world_parameters.f0[i];
+    }
 
-  // Synthesis 1 (conventional synthesis)
-  for (int i = 0; i < y_length; ++i) y[i] = 0.0;
-  WaveformSynthesis(&world_parameters, fs, y_length, y);
-  sprintf(filename, "01%s", argv[2]);
-  wavwrite(y, y_length, fs, 16, filename);
+    //---------------------------------------------------------------------------
+    // Synthesis part
+    // There are three samples in speech synthesis
+    // 1: Conventional synthesis
+    // 2: Example of real-time synthesis
+    // 3: Example of real-time synthesis (Ring buffer is efficiently used)
+    //---------------------------------------------------------------------------
+    char filename[100];
+    // The length of the output waveform
+    int y_length = static_cast<int>((x_world_parameters.f0_length - 1) *
+    x_world_parameters.frame_period / 1000.0 * x_fs) + 1;
+    double *y = new double[y_length];
 
-  // Synthesis 2 (All frames are added at the same time)
-  for (int i = 0; i < y_length; ++i) y[i] = 0.0;
-  WaveformSynthesis2(&world_parameters, fs, y_length, y);
-  sprintf(filename, "02%s", argv[2]);
-  wavwrite(y, y_length, fs, 16, filename);
+    // Synthesis 1 (conventional synthesis)
+    for (int i = 0; i < y_length; ++i) y[i] = 0.0;
+    WaveformSynthesis(&x_world_parameters, x_fs, y_length, y);
+    sprintf(filename, argv[3]);
+    wavwrite(y, y_length, x_fs, 16, filename);
 
-  // Synthesis 3 (Ring buffer is efficiently used.)
-  for (int i = 0; i < y_length; ++i) y[i] = 0.0;
-  WaveformSynthesis3(&world_parameters, fs, y_length, y);
-  sprintf(filename, "03%s", argv[2]);
-  wavwrite(y, y_length, fs, 16, filename);
+    delete[] y;
+    delete[] x;
+    delete[] ref;
+    DestroyMemory(&x_world_parameters);
+    DestroyMemory(&ref_world_parameters);
 
-  delete[] y;
-  delete[] x;
-  DestroyMemory(&world_parameters);
-
-  printf("complete.\n");
-  return 0;
+    printf("complete.\n");
+    return 0;
 }
